@@ -2,7 +2,8 @@
 import os
 import sys
 import asyncio
-import keyboard
+# Replacing keyboard with pynput
+from pynput import keyboard
 import time
 import tempfile
 import anthropic
@@ -38,7 +39,7 @@ pygame.init()
 conversation_history = []
 shutdown_event = asyncio.Event()
 model_size = "tiny"
-compute_type = "float16"
+compute_type = "float32"  # Changed from float16 to float32
 recording_finished = False
 is_recording = False
 
@@ -93,17 +94,20 @@ def record_audio():
     return audio_data, fs
 
 
-def on_space_press(event):
+def on_space_press(key):
     global is_recording, current_state
-    if event.name == 'space':
-        if current_state == States.WAITING_FOR_USER:
-            is_recording = True
-            current_state = States.RECORDING_USER_INPUT
-            print(Fore.YELLOW + "Recording started. Press the space bar to stop.")
-        elif current_state == States.RECORDING_USER_INPUT and is_recording:
-            is_recording = False  # This will trigger the recording to stop
-            print("Recording stopped. Processing input...")
-            current_state = States.PROCESSING_USER_INPUT
+    try:
+        if key == keyboard.Key.space:
+            if current_state == States.WAITING_FOR_USER:
+                is_recording = True
+                current_state = States.RECORDING_USER_INPUT
+                print(Fore.YELLOW + "Recording started. Press the space bar to stop.")
+            elif current_state == States.RECORDING_USER_INPUT and is_recording:
+                is_recording = False  # This will trigger the recording to stop
+                print("Recording stopped. Processing input...")
+                current_state = States.PROCESSING_USER_INPUT
+    except AttributeError:
+        pass
 
 
 def transcribe_audio_to_text(audio_data, sample_rate):
@@ -113,8 +117,9 @@ def transcribe_audio_to_text(audio_data, sample_rate):
     temp_file_path = tempfile.mktemp(suffix='.wav', dir=temp_dir)
     try:
         write(temp_file_path, sample_rate, audio_data)
+        # Changed device from "cuda" to "cpu" to avoid CUDA error
         segments, _ = WhisperModel(
-            model_size, device="cuda", compute_type=compute_type).transcribe(temp_file_path)
+            model_size, device="cpu", compute_type=compute_type).transcribe(temp_file_path)
         transcript = " ".join(segment.text for segment in segments)
         print(Fore.GREEN + "User:", transcript)
         end_time = time.time()  # Record the end time
@@ -128,6 +133,11 @@ def transcribe_audio_to_text(audio_data, sample_rate):
 
 
 def generate_and_process_text(user_input, transcript_file):
+    # Check if user_input is None and handle it gracefully
+    if user_input is None:
+        print(Fore.RED + "Transcription failed, skipping...")
+        return
+
     # Trim whitespace and check if input is empty
     user_input = user_input.strip()
     if user_input:  # Proceed only if user_input is not empty
@@ -194,15 +204,21 @@ def queue_chunk_for_processing(chunk):
 
 def run_async_tasks():
     # Set up the event loop and run the async tasks
+    global async_tasks
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    loop.run_until_complete(start_async_tasks(text_to_speech_queue))
+    async_tasks = loop.run_until_complete(start_async_tasks(text_to_speech_queue))
 
     try:
         loop.run_until_complete(shutdown_event.wait())
     finally:
+        # Cancel all tasks before closing the loop
+        for task in async_tasks:
+            if not task.done():
+                task.cancel()
+        loop.run_until_complete(asyncio.gather(*async_tasks, return_exceptions=True))
         loop.close()
 
 
@@ -269,7 +285,7 @@ def setup_transcript_file(transcript_filename):
 
 
 def main():
-    global current_state, is_recording, conversation_history
+    global current_state, is_recording, conversation_history, async_tasks
 
     if len(sys.argv) == 2:
         transcript_filename = sys.argv[1]
@@ -294,7 +310,10 @@ def main():
     previous_state = None
 
     try:
-        keyboard.on_press(on_space_press)
+        # Create a keyboard listener
+        listener = keyboard.Listener(on_press=on_space_press)
+        listener.start()
+
         while True:
             if current_state != previous_state:
                 previous_state = current_state  # Update previous_state
@@ -319,8 +338,17 @@ def main():
 
     except KeyboardInterrupt:
         print(Fore.RED + "\nShutting down gracefully...")
+    finally:
+        # Stop the keyboard listener
+        if 'listener' in locals() and listener.is_alive():
+            listener.stop()
+        
+        # Signal shutdown and wait for thread to complete
         shutdown_event.set()
-        thread.join()
+        if thread.is_alive():
+            thread.join(timeout=2.0)  # Give thread 2 seconds to finish
+        
+        print(Fore.GREEN + "Shutdown complete.")
 
 
 if __name__ == "__main__":
